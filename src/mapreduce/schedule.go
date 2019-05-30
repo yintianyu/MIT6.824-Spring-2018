@@ -34,22 +34,34 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	// Your code here (Part III, Part IV).
 	//
 	var wg sync.WaitGroup
-	debug("ntasks = %d\n", ntasks)
+	idxChan := make(chan int, ntasks)
 	for i := 0; i < ntasks; i++ {
 		wg.Add(1)
-		go func(num int) {
-			debug("Fetching No.%d addr\n", num)
-			address := <-registerChan
-			debug("No.%d addr fetched\n", num)
-			args := DoTaskArgs{jobName, mapFiles[num], phase, num, n_other}
-			call(address, "Worker.DoTask", args, nil)
-			debug("Task %d finished\n", num)
-			wg.Done()
-			debug("Task %d defered\n", num)
-			registerChan <- address
-			debug("address %s returned to channel\n", address)
-		}(i)
+		idxChan <- i
 	}
+	debug("ntasks = %d\n", ntasks)
+	go func() {
+		for {
+			num := <-idxChan
+			go func(num int) {
+				debug("Fetching No.%d addr\n", num)
+				address := <-registerChan
+				debug("No.%d addr fetched\n", num)
+				args := DoTaskArgs{jobName, mapFiles[num], phase, num, n_other}
+				res := call(address, "Worker.DoTask", args, nil)
+				debug("Task %d finished\n", num)
+				if res == true {
+					wg.Done()
+					debug("Task %d done\n", num)
+					registerChan <- address
+				} else {
+					debug("Task %d failed\n", num)
+					idxChan <- num
+				}
+				debug("address %s returned to channel\n", address)
+			}(num)
+		}
+	}()
 	debug("All tasks sent, waiting for finish\n")
 	wg.Wait()
 	fmt.Printf("Schedule: %v done\n", phase)
