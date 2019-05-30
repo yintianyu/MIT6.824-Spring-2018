@@ -60,16 +60,22 @@ func doMap(
 	bytes, _ := ioutil.ReadFile(inFile)
 	s := string(bytes[:])
 	keyValues := mapF(inFile, s)
+	var files []*os.File
+	for i := 0; i < nReduce; i++ {
+		name := reduceName(jobName, mapTask, i)
+		file, _ := os.OpenFile(name, os.O_CREATE|os.O_WRONLY, 0600)
+		files = append(files, file)
+	}
 	for _, val := range keyValues {
 		r := ihash(val.Key) % nReduce
-		name := reduceName(jobName, mapTask, r)
-		file, _ := os.OpenFile(name, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-		enc := json.NewEncoder(file)
+		enc := json.NewEncoder(files[r])
 		err := enc.Encode(&val)
 		if err != nil {
 			log.Fatal(err)
 		}
-		file.Close()
+	}
+	for i := 0; i < nReduce; i++ {
+		files[i].Close()
 	}
 }
 
