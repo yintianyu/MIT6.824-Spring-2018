@@ -17,13 +17,15 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "labrpc"
+import (
+	"labrpc"
+	"math/rand"
+	"sync"
+	"time"
+)
 
 // import "bytes"
 // import "labgob"
-
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -54,7 +56,15 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	state       int      // state machine : 0 - leader 1 - follwer 2 - candidate
+	currentTerm int      // lastest term server has seen(initialized to 0)
+	votedFor    int      // candidateId that received vote in current term(or null if none)
+	log         []string // log entries; each entry contains command for state machine, and term when entry was recieved by leader
+	commitIndex int      // index of highest log entry known to be commited(initialized to 0)
+	lastApplied int      // index of highest log entry applied to state machine(initialized to 0)
 
+	voteTimer *time.Timer // vote timer
+	mux       sync.Mutex
 }
 
 // return currentTerm and whether this server
@@ -64,9 +74,12 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mux.Lock()
+	term = rf.currentTerm
+	isleader = rf.state == 0
+	rf.mux.Unlock()
 	return term, isleader
 }
-
 
 //
 // save Raft's persistent state to stable storage,
@@ -83,7 +96,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -107,15 +119,16 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int // candidate's term
+	CandidateId  int // candidate requesting vote
+	LastLogIndex int // index of candidates's last log entry
+	LastLogTerm  int // term of candidate's last log entry
 }
 
 //
@@ -124,6 +137,32 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int  // currentTerm, for candidate to update itself
+	VoteGranted bool // true means candidate received vote
+}
+
+//
+// example AppendEntries RPC arguments structure
+// field names must start with capital letters!
+//
+type AppendEntriesArgs struct {
+	// Your data here.
+	Term         int      // leader's term
+	LeaderId     int      // so follower can redirect clients
+	PrevLogIndex int      // index of log entry immediately preceding new ones
+	PrevLogTerm  int      // term of prevLogIndex entry
+	Entries      []string // log entries to store(empty for heartbeat; may send more than one for efficiency)
+	LeaderCommit int      // leader's commitIndex
+}
+
+//
+// example AppendEntries RPC reply structure
+// field names must start with capital letters!
+//
+type AppendEntriesReply struct {
+	// Your data here.
+	Term    int  // currentTerm, for leader to update itself
+	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
 }
 
 //
@@ -131,6 +170,43 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mux.Lock()
+	if rf.currentTerm < args.Term {
+		rf.currentTerm = args.Term
+		rf.state = 1
+		rf.votedFor = args.CandidateId
+		reply.VoteGranted = true
+		reply.Term = rf.currentTerm
+		rf.voteTimerReset()
+		DPrintf("[Server %d] Voted to %d at Term %d\n", rf.me, rf.votedFor, rf.currentTerm)
+	} else {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		DPrintf("[Server %d] Reject %d at Term %d\n", rf.me, args.CandidateId, rf.currentTerm)
+	}
+	rf.mux.Unlock()
+}
+
+//
+// example AppendEntries RPC handler
+//
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// Your code here.
+	rf.mux.Lock()
+	if rf.currentTerm <= args.Term {
+		rf.currentTerm = args.Term
+		reply.Term = args.Term
+		reply.Success = true
+		rf.state = 1
+		DPrintf("[Server %d] in appendEntries handler SUCCESS at Term %d\n", rf.me, args.Term)
+		rf.mux.Unlock()
+		rf.voteTimerReset()
+	} else {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		DPrintf("[Server %d] in appendEntries handler FAIL at Term %d\n", rf.me, reply.Term)
+		rf.mux.Unlock()
+	}
 }
 
 //
@@ -167,6 +243,13 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+//
+// example code to send a AppendEntries RPC to a server.
+//
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -189,7 +272,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 
-
 	return index, term, isLeader
 }
 
@@ -201,6 +283,126 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+}
+
+// vote timer check
+func (rf *Raft) voteTimerCheck() {
+	for {
+		<-rf.voteTimer.C
+		rf.mux.Lock()
+		if rf.state != 0 {
+			DPrintf("[Server %d] vote Timer expires at Term %d\n", rf.me, rf.currentTerm)
+			rf.state = 2 // turn to candidate
+			rf.mux.Unlock()
+			go rf.issueVote()
+		} else {
+			DPrintf("[Server %d] vote Timer expires at Term %d, but a leader\n", rf.me, rf.currentTerm)
+			rf.mux.Unlock()
+		}
+		rf.voteTimerReset()
+	}
+}
+
+// vote timer Reset
+func (rf *Raft) voteTimerReset() {
+	if !rf.voteTimer.Stop() && len(rf.voteTimer.C) > 0 {
+		<-rf.voteTimer.C
+	}
+	d := rand.Int31n(250) + 400
+	rf.voteTimer.Reset(time.Duration(d) * time.Millisecond)
+}
+
+//
+// issue a vote
+//
+func (rf *Raft) issueVote() {
+	rf.voteTimerReset()
+	rf.mux.Lock()
+	rf.currentTerm++
+	DPrintf("[Server %d] issues a vote at Term %d\n", rf.me, rf.currentTerm)
+	var args RequestVoteArgs
+	args.Term = rf.currentTerm
+	args.CandidateId = rf.me
+	rf.votedFor = rf.me
+	rf.mux.Unlock()
+	count := 1
+	voteMeChan := make(chan bool)
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me {
+			go func(i int) { // send requestVote to another
+				var reply RequestVoteReply
+				ok := rf.sendRequestVote(i, &args, &reply)
+				if !ok {
+					voteMeChan <- false
+					DPrintf("[Server %d] requestVote to %d return failed at Term %d, granted = %v\n", rf.me, i, rf.currentTerm, reply.VoteGranted)
+				} else {
+					if reply.VoteGranted {
+						voteMeChan <- true
+						DPrintf("[Server %d] %d voted to me at Term %d\n", rf.me, i, reply.Term)
+					} else {
+						voteMeChan <- false
+						rf.mux.Lock()
+						DPrintf("[Server %d] %d didn't vote to me at Term %d\n", rf.me, i, reply.Term)
+						if reply.Term > rf.currentTerm {
+							DPrintf("[Server %d] Term is corrected by %d during election\n", rf.me, i)
+							rf.currentTerm = reply.Term
+							rf.state = 1
+						}
+						rf.mux.Unlock()
+					}
+				}
+			}(i)
+		}
+	}
+	for i := 0; i < len(rf.peers)-1; i++ {
+		voteMe := <-voteMeChan
+		DPrintf("[Server %d] got vote No.%d, %v\n", rf.me, i, voteMe)
+		if voteMe {
+			count++
+		}
+		if count > len(rf.peers)/2 {
+			break
+		}
+	}
+	DPrintf("[Server %d] count = %d at Term %d BEFORE LOCK\n", rf.me, count, rf.currentTerm)
+	rf.mux.Lock()
+	DPrintf("[Server %d] count = %d at Term %d AFTER LOCK\n", rf.me, count, rf.currentTerm)
+	if rf.state == 2 && count > len(rf.peers)/2 {
+		rf.state = 0 // wins
+		DPrintf("[Server %d] becomes leader at Term %d\n", rf.me, rf.currentTerm)
+	} else if rf.state == 2 {
+		rf.state = 1 // fails
+		DPrintf("[Server %d] fails the election at Term %d\n", rf.me, rf.currentTerm)
+	}
+	rf.mux.Unlock()
+}
+
+//
+// Leader HeartBeat
+//
+func (rf *Raft) leaderHeartbeat() {
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me {
+			go func(i int) {
+				var args AppendEntriesArgs
+				var reply AppendEntriesReply
+				rf.mux.Lock()
+				args.Term = rf.currentTerm
+				args.LeaderId = rf.me
+				rf.mux.Unlock()
+				ok := rf.sendAppendEntries(i, &args, &reply)
+				if ok {
+					rf.mux.Lock()
+					if reply.Term > rf.currentTerm {
+						DPrintf("[Server %d] Term %d -> %d during heartbeat, convert to follower\n", rf.me, rf.currentTerm, reply.Term)
+						rf.currentTerm = reply.Term
+						rf.state = 1
+					}
+					rf.mux.Unlock()
+				}
+			}(i)
+		}
+	}
 }
 
 //
@@ -222,10 +424,39 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.state = 1 // initially follower
+	rf.currentTerm = 0
+
+	d := rand.Int31n(150) + 500
+	rf.voteTimer = time.NewTimer(time.Duration(d) * time.Millisecond)
+
+	go rf.voteTimerCheck() // vote timer checker
+	// behavior
+	go func() {
+		for {
+			rf.mux.Lock()
+			if rf.state == 2 {
+				rf.mux.Unlock()
+				// rf.issueVote()
+			} else if rf.state == 0 {
+				rf.mux.Unlock()
+				time.Sleep(time.Duration(150) * time.Millisecond)
+				rf.mux.Lock()
+				if rf.state == 0 {
+					rf.mux.Unlock()
+					rf.leaderHeartbeat()
+				} else {
+					rf.mux.Unlock()
+				}
+				// TODO: Send AppendEntries
+			} else {
+				rf.mux.Unlock()
+			}
+		}
+	}()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
 
 	return rf
 }
